@@ -76,4 +76,4 @@
    python3 ragnarokbackup.py --restore <backup_file>
    ```
 
-> Make sure backup file is in the same directory as `ragnarokbackup.py` otherwise you will need to specify paths :(
+   > Make sure backup file is in the same directory as `ragnarokbackup.py` otherwise you will need to specify paths :(
