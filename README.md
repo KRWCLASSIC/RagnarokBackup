@@ -1,6 +1,8 @@
-# Ragnarok Backup `0.1`
+# Ragnarok Backup `0.2`
 
 **Ragnarok Backup** is a simple, powerful, and scriptable backup tool for Linux servers. It uses a `.gitignore`-like file to specify exactly what to back up, making it easy to create reproducible, auditable, and minimal backups. Designed for sysadmins and power users, it focuses on reliability, transparency, and automation.
+
+> For now, its only supports apt! other package managers will be added in the future.
 
 ## What is Ragnarok Backup?
 

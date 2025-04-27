@@ -1,13 +1,13 @@
-import argparse
-import os
 from pathlib import Path
-import shutil
-import tempfile
-import json
-import sys
 import subprocess
+import tempfile
+import argparse
 import tarfile
 import filecmp
+import shutil
+import json
+import sys
+import os
 
 # ANSI color codes
 class Colors:
@@ -346,6 +346,67 @@ def compare_apt_repos(backup_apt_repos_file, verbose=False):
         cprint(f"Error comparing apt repos: {e}", Colors.WARNING)
         return False
 
+def parse_dpkg_list(dpkg_text):
+    """Parse dpkg -l output into a dict of {package: version}."""
+    packages = {}
+    for line in dpkg_text.splitlines():
+        if line.startswith("ii"):
+            parts = line.split()
+            if len(parts) >= 3:
+                pkg, ver = parts[1], parts[2]
+                packages[pkg] = ver
+    return packages
+
+def get_current_packages():
+    """Get currently installed packages and versions as a dict."""
+    try:
+        output = subprocess.check_output(
+            ["dpkg", "-l"], universal_newlines=True
+        )
+        return parse_dpkg_list(output)
+    except Exception as e:
+        cprint(f"Error getting current packages: {e}", Colors.WARNING)
+        return {}
+
+def handle_package_restore(backup_pkg_file, dry_run=False, verbose=False):
+    if not backup_pkg_file.exists():
+        cprint("No installed_packages.txt found in backup.", Colors.WARNING)
+        return
+
+    # Parse backup packages
+    backup_pkgs = parse_dpkg_list(backup_pkg_file.read_text())
+    current_pkgs = get_current_packages()
+
+    for pkg, backup_ver in backup_pkgs.items():
+        current_ver = current_pkgs.get(pkg)
+        if current_ver == backup_ver:
+            if verbose:
+                cprint(f"Package {pkg} already installed at version {backup_ver}.", Colors.OKCYAN)
+            continue
+        elif current_ver is None:
+            cprint(f"Package {pkg} not installed. Will install version {backup_ver}.", Colors.OKGREEN)
+            if not dry_run:
+                subprocess.run(["sudo", "apt-get", "install", f"{pkg}={backup_ver}"], check=False)
+        else:
+            # Compare versions
+            from packaging import version
+            if version.parse(current_ver) < version.parse(backup_ver):
+                # Ask to update
+                ans = "y"
+                if not dry_run:
+                    ans = input(f"Package {pkg} is installed at {current_ver}, backup has newer {backup_ver}. Update? (y/n): ").strip().lower()
+                if ans in ("y", "yes"):
+                    cprint(f"Updating {pkg} to {backup_ver}.", Colors.OKGREEN)
+                    if not dry_run:
+                        subprocess.run(["sudo", "apt-get", "install", f"{pkg}={backup_ver}"], check=False)
+                else:
+                    cprint(f"Skipped updating {pkg}.", Colors.WARNING)
+            elif version.parse(current_ver) > version.parse(backup_ver):
+                cprint(f"Package {pkg} is installed at newer version {current_ver} than backup {backup_ver}. Skipping downgrade.", Colors.WARNING)
+            else:
+                # Should not reach here, but just in case
+                cprint(f"Package {pkg} version mismatch: current {current_ver}, backup {backup_ver}.", Colors.WARNING)
+
 def restore(args):
     import tempfile
     import zipfile
@@ -449,6 +510,11 @@ def restore(args):
                         else:
                             if verbose:
                                 cprint(f"Skipped APT repositories: {dst_path}", Colors.WARNING)
+
+        # --- Handle installed packages ---
+        meta_path = meta_dir / "installed_packages.txt"
+        if meta_path.exists():
+            handle_package_restore(meta_path, dry_run=dry_run, verbose=verbose)
 
     # 4. Restore files
     cprint("Restoring files...", Colors.HEADER)
