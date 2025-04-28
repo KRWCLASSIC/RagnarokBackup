@@ -135,6 +135,7 @@ def backup(args):
         (tempdir / "home_dirs").mkdir()
         (tempdir / "files").mkdir()
         affiliation = {}
+        permissions = {}  # NEW: store permissions
 
         # --- METADATA COLLECTION ---
         cprint("Collecting system metadata...", Colors.OKBLUE)
@@ -162,13 +163,28 @@ def backup(args):
                 else:
                     shutil.copy2(src, dest)
                 affiliation[str(dest.relative_to(tempdir))] = str(src)
+                # NEW: record permissions
+                st = src.stat()
+                permissions[str(dest.relative_to(tempdir))] = {
+                    "mode": st.st_mode,
+                    "uid": st.st_uid,
+                    "gid": st.st_gid
+                }
                 if verbose:
                     cprint(f"Added file: {src} -> {dest} (empty: {args.dry_run})", Colors.OKCYAN)
             elif src.is_dir():
                 for root, dirs, files in os.walk(src):
                     rel_root = Path(root).relative_to(src)
                     for d in dirs:
-                        (dest / rel_root / d).mkdir(parents=True, exist_ok=True)
+                        dir_path = dest / rel_root / d
+                        dir_path.mkdir(parents=True, exist_ok=True)
+                        # NEW: record permissions for directories
+                        st = (Path(root) / d).stat()
+                        permissions[str(dir_path.relative_to(tempdir))] = {
+                            "mode": st.st_mode,
+                            "uid": st.st_uid,
+                            "gid": st.st_gid
+                        }
                     for file in files:
                         src_file = Path(root) / file
                         dest_file = dest / rel_root / file
@@ -178,6 +194,13 @@ def backup(args):
                         else:
                             shutil.copy2(src_file, dest_file)
                         affiliation[str(dest_file.relative_to(tempdir))] = str(src_file)
+                        # NEW: record permissions for files
+                        st = src_file.stat()
+                        permissions[str(dest_file.relative_to(tempdir))] = {
+                            "mode": st.st_mode,
+                            "uid": st.st_uid,
+                            "gid": st.st_gid
+                        }
                         if verbose:
                             cprint(f"Added file: {src_file} -> {dest_file} (empty: {args.dry_run})", Colors.OKCYAN)
             else:
@@ -188,6 +211,12 @@ def backup(args):
         with open(aff_path, "w") as f:
             json.dump(affiliation, f, indent=2)
         cprint(f"Created affiliation.json with {len(affiliation)} entries.", Colors.OKGREEN)
+
+        # NEW: Write permissions.json
+        perm_path = tempdir / "permissions.json"
+        with open(perm_path, "w") as f:
+            json.dump(permissions, f, indent=2)
+        cprint(f"Created permissions.json with {len(permissions)} entries.", Colors.OKGREEN)
 
         # Determine output archive path and compression
         from datetime import datetime
@@ -535,6 +564,30 @@ def restore(args):
         else:
             continue
 
+    # NEW: Restore permissions unless --no-perm
+    perm_path = temp_path / "permissions.json"
+    permissions = {}
+    if perm_path.exists():
+        with open(perm_path, "r") as f:
+            permissions = json.load(f)
+    else:
+        cprint("permissions.json not found in backup! Permissions will not be restored.", Colors.WARNING)
+
+    if not args.no_perm and permissions:
+        cprint("Restoring file permissions and ownership...", Colors.OKBLUE)
+        for rel_path, perm in permissions.items():
+            dst = Path(affiliation.get(rel_path, rel_path))
+            try:
+                if dst.exists():
+                    os.chmod(dst, perm["mode"])
+                    os.chown(dst, perm["uid"], perm["gid"])
+                    if args.verbose:
+                        cprint(f"Set permissions for {dst}: mode={oct(perm['mode'])}, uid={perm['uid']}, gid={perm['gid']}", Colors.OKCYAN)
+            except Exception as e:
+                cprint(f"Failed to set permissions for {dst}: {e}", Colors.WARNING)
+    elif args.no_perm:
+        cprint("Skipping permission and ownership restoration (--no-perm set).", Colors.WARNING)
+
     cprint("Restore complete!" if not dry_run else "[DRY-RUN] Restore simulation complete!", Colors.OKBLUE)
     tempdir.cleanup()
 
@@ -583,6 +636,11 @@ def main():
         "--postrest",
         type=str,
         help="Script to run after restore (local path or URL)."
+    )
+    parser.add_argument(
+        "--no-perm",
+        action="store_true",
+        help="Do not restore file permissions and ownership."
     )
 
     group = parser.add_mutually_exclusive_group(required=True)
