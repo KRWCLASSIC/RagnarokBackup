@@ -136,6 +136,7 @@ def backup(args):
         (tempdir / "files").mkdir()
         affiliation = {}
         permissions = {}  # NEW: store permissions
+        links = {}  # NEW: store symbolic links
 
         # --- METADATA COLLECTION ---
         cprint("Collecting system metadata...", Colors.OKBLUE)
@@ -172,37 +173,111 @@ def backup(args):
                 }
                 if verbose:
                     cprint(f"Added file: {src} -> {dest} (empty: {args.dry_run})", Colors.OKCYAN)
+            # NEW: Handle symbolic links
+            elif src.is_symlink():
+                target = os.readlink(src)
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                if args.dry_run:
+                    dest.touch()
+                else:
+                    # Store the content of the link target as a regular file
+                    try:
+                        shutil.copy2(src, dest, follow_symlinks=False)
+                    except (shutil.SameFileError, OSError):
+                        # If copy fails, just create an empty file
+                        dest.touch()
+                affiliation[str(dest.relative_to(tempdir))] = str(src)
+                # Record link information
+                links[str(dest.relative_to(tempdir))] = {
+                    "target": target,
+                    "is_absolute": Path(target).is_absolute()
+                }
+                if verbose:
+                    cprint(f"Added symlink: {src} -> {target} (archived as regular file)", Colors.OKCYAN)
             elif src.is_dir():
-                for root, dirs, files in os.walk(src):
+                for root, dirs, files in os.walk(src, followlinks=False):
                     rel_root = Path(root).relative_to(src)
                     for d in dirs:
-                        dir_path = dest / rel_root / d
-                        dir_path.mkdir(parents=True, exist_ok=True)
-                        # NEW: record permissions for directories
-                        st = (Path(root) / d).stat()
-                        permissions[str(dir_path.relative_to(tempdir))] = {
-                            "mode": st.st_mode,
-                            "uid": st.st_uid,
-                            "gid": st.st_gid
-                        }
+                        dir_path = Path(root) / d
+                        # Check if directory is a symlink before processing it as a directory
+                        if dir_path.is_symlink():
+                            symlink_archive_path, _ = get_archive_path(dir_path, home)
+                            symlink_dest = tempdir / symlink_archive_path
+                            symlink_dest.parent.mkdir(parents=True, exist_ok=True)
+                            
+                            # Handle directory symlink
+                            target = os.readlink(dir_path)
+                            if args.dry_run:
+                                symlink_dest.touch()
+                            else:
+                                # Create a marker file for directory symlinks
+                                symlink_dest.mkdir(parents=True, exist_ok=True)
+                            
+                            # Record in affiliation and links
+                            affiliation[str(symlink_dest.relative_to(tempdir))] = str(dir_path)
+                            links[str(symlink_dest.relative_to(tempdir))] = {
+                                "target": target,
+                                "is_absolute": Path(target).is_absolute(),
+                                "is_dir": True
+                            }
+                            if verbose:
+                                cprint(f"Added directory symlink: {dir_path} -> {target}", Colors.OKCYAN)
+                        else:
+                            # Regular directory
+                            dest_dir = dest / rel_root / d
+                            dest_dir.mkdir(parents=True, exist_ok=True)
+                            # Record permissions for directories
+                            st = dir_path.stat()
+                            permissions[str(dest_dir.relative_to(tempdir))] = {
+                                "mode": st.st_mode,
+                                "uid": st.st_uid,
+                                "gid": st.st_gid
+                            }
+                    
                     for file in files:
                         src_file = Path(root) / file
-                        dest_file = dest / rel_root / file
-                        dest_file.parent.mkdir(parents=True, exist_ok=True)
-                        if args.dry_run:
-                            dest_file.touch()
+                        # Check if file is a symlink
+                        if src_file.is_symlink():
+                            dest_file = dest / rel_root / file
+                            dest_file.parent.mkdir(parents=True, exist_ok=True)
+                            
+                            target = os.readlink(src_file)
+                            if args.dry_run:
+                                dest_file.touch()
+                            else:
+                                try:
+                                    # Store the content as a regular file
+                                    shutil.copy2(src_file, dest_file, follow_symlinks=False)
+                                except (shutil.SameFileError, OSError):
+                                    # If copy fails, just create an empty file
+                                    dest_file.touch()
+                                    
+                            affiliation[str(dest_file.relative_to(tempdir))] = str(src_file)
+                            links[str(dest_file.relative_to(tempdir))] = {
+                                "target": target,
+                                "is_absolute": Path(target).is_absolute()
+                            }
+                            if verbose:
+                                cprint(f"Added symlink: {src_file} -> {target} (archived as regular file)", Colors.OKCYAN)
                         else:
-                            shutil.copy2(src_file, dest_file)
-                        affiliation[str(dest_file.relative_to(tempdir))] = str(src_file)
-                        # NEW: record permissions for files
-                        st = src_file.stat()
-                        permissions[str(dest_file.relative_to(tempdir))] = {
-                            "mode": st.st_mode,
-                            "uid": st.st_uid,
-                            "gid": st.st_gid
-                        }
-                        if verbose:
-                            cprint(f"Added file: {src_file} -> {dest_file} (empty: {args.dry_run})", Colors.OKCYAN)
+                            # Regular file
+                            dest_file = dest / rel_root / file
+                            dest_file.parent.mkdir(parents=True, exist_ok=True)
+                            if args.dry_run:
+                                dest_file.touch()
+                            else:
+                                shutil.copy2(src_file, dest_file)
+                            
+                            affiliation[str(dest_file.relative_to(tempdir))] = str(src_file)
+                            # Record permissions for files
+                            st = src_file.stat()
+                            permissions[str(dest_file.relative_to(tempdir))] = {
+                                "mode": st.st_mode,
+                                "uid": st.st_uid,
+                                "gid": st.st_gid
+                            }
+                            if verbose:
+                                cprint(f"Added file: {src_file} -> {dest_file} (empty: {args.dry_run})", Colors.OKCYAN)
             else:
                 cprint(f"Skipping unknown path type: {path}", Colors.WARNING)
 
@@ -212,11 +287,18 @@ def backup(args):
             json.dump(affiliation, f, indent=2)
         cprint(f"Created affiliation.json with {len(affiliation)} entries.", Colors.OKGREEN)
 
-        # NEW: Write permissions.json
+        # Write permissions.json
         perm_path = tempdir / "permissions.json"
         with open(perm_path, "w") as f:
             json.dump(permissions, f, indent=2)
         cprint(f"Created permissions.json with {len(permissions)} entries.", Colors.OKGREEN)
+
+        # NEW: Write links.json
+        if links:
+            links_path = tempdir / "links.json"
+            with open(links_path, "w") as f:
+                json.dump(links, f, indent=2)
+            cprint(f"Created links.json with {len(links)} entries.", Colors.OKGREEN)
 
         # Determine output archive path and compression
         from datetime import datetime
@@ -484,6 +566,14 @@ def restore(args):
         sys.exit(1)
     with open(affil_path, "r") as f:
         affiliation = json.load(f)
+        
+    # NEW: Read links.json if it exists
+    links = {}
+    links_path = temp_path / "links.json"
+    if links_path.exists():
+        with open(links_path, "r") as f:
+            links = json.load(f)
+        cprint(f"Found links.json with {len(links)} entries.", Colors.OKBLUE)
 
     # 3. Handle metadata
     meta_dir = temp_path / "metadata"
@@ -554,7 +644,13 @@ def restore(args):
             cprint(f"Warning: Archive file missing: {archive_rel}", Colors.WARNING)
             continue
 
-        if src.is_file():
+        # Check if it's a symbolic link
+        if archive_rel in links:
+            # Skip direct file restoration for links - we'll handle them in a separate pass
+            if verbose:
+                cprint(f"Skipping direct restoration of {dst} as it will be created as a symlink", Colors.OKCYAN)
+            continue
+        elif src.is_file():
             result = handle_conflict(src, dst, dry_run, conflict, what="file", verbose=verbose)
             if result == "restore" and not dry_run:
                 dst.parent.mkdir(parents=True, exist_ok=True)
@@ -562,9 +658,86 @@ def restore(args):
             elif result == "overwrite" and not dry_run:
                 shutil.copy2(src, dst)
         else:
-            continue
+            # Create directories if they don't exist
+            if not dst.exists() and not dry_run:
+                dst.mkdir(parents=True, exist_ok=True)
+                if verbose:
+                    cprint(f"Created directory: {dst}", Colors.OKGREEN)
 
-    # NEW: Restore permissions unless --no-perm
+    # NEW: Restore symlinks in a separate pass
+    if links:
+        cprint("Restoring symbolic links...", Colors.HEADER)
+        for archive_rel, link_info in links.items():
+            # Get the original path from affiliation
+            if archive_rel not in affiliation:
+                cprint(f"Warning: Link entry {archive_rel} not found in affiliation.json", Colors.WARNING)
+                continue
+                
+            dst = Path(affiliation[archive_rel])
+            target = link_info["target"]
+            is_dir = link_info.get("is_dir", False)
+            
+            # If target is not absolute, make it relative to the link's parent directory
+            if not link_info.get("is_absolute", False):
+                # Target remains as stored - it's already relative
+                pass
+                
+            # Handle link creation
+            if dst.exists():
+                if dst.is_symlink():
+                    current_target = os.readlink(dst)
+                    if current_target == target:
+                        if verbose:
+                            cprint(f"Symlink already exists with correct target: {dst} -> {target}", Colors.OKCYAN)
+                        continue
+                    elif conflict == "overwrite":
+                        if not dry_run:
+                            dst.unlink()
+                        else:
+                            cprint(f"[DRY-RUN] Would overwrite symlink: {dst} -> {target}", Colors.OKGREEN)
+                    elif conflict == "skip":
+                        if verbose:
+                            cprint(f"Skipping existing symlink: {dst}", Colors.WARNING)
+                        continue
+                    else:
+                        if dry_run:
+                            cprint(f"[DRY-RUN] Would ask to overwrite symlink: {dst}", Colors.OKCYAN)
+                            continue
+                        elif not prompt_overwrite(dst):
+                            if verbose:
+                                cprint(f"Skipped symlink: {dst}", Colors.WARNING)
+                            continue
+                        else:
+                            if not dry_run:
+                                dst.unlink()
+                else:
+                    # Handle conflict with existing non-symlink
+                    result = handle_conflict(temp_path / archive_rel, dst, dry_run, conflict, what="symlink", verbose=verbose)
+                    if result != "overwrite":
+                        continue
+                    if not dry_run:
+                        # Remove existing file/dir to make way for symlink
+                        if dst.is_dir():
+                            shutil.rmtree(dst)
+                        else:
+                            dst.unlink()
+            
+            # Create the symlink
+            if not dry_run:
+                # Make sure parent directory exists
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                
+                # Create the symlink
+                try:
+                    os.symlink(target, dst, target_is_directory=is_dir)
+                    if verbose:
+                        cprint(f"Created symlink: {dst} -> {target}", Colors.OKGREEN)
+                except OSError as e:
+                    cprint(f"Failed to create symlink {dst} -> {target}: {e}", Colors.FAIL)
+            else:
+                cprint(f"[DRY-RUN] Would create symlink: {dst} -> {target}", Colors.OKGREEN)
+
+    # Restore permissions unless --no-perm
     perm_path = temp_path / "permissions.json"
     permissions = {}
     if perm_path.exists():
