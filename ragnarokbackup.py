@@ -8,6 +8,8 @@ import shutil
 import json
 import sys
 import os
+import pwd
+import grp
 
 # ANSI color codes
 class Colors:
@@ -169,7 +171,9 @@ def backup(args):
                 permissions[str(dest.relative_to(tempdir))] = {
                     "mode": st.st_mode,
                     "uid": st.st_uid,
-                    "gid": st.st_gid
+                    "gid": st.st_gid,
+                    "user": pwd.getpwuid(st.st_uid).pw_name, # NEW
+                    "group": grp.getgrgid(st.st_gid).gr_name # NEW
                 }
                 if verbose:
                     cprint(f"Added file: {src} -> {dest} (empty: {args.dry_run})", Colors.OKCYAN)
@@ -231,7 +235,9 @@ def backup(args):
                             permissions[str(dest_dir.relative_to(tempdir))] = {
                                 "mode": st.st_mode,
                                 "uid": st.st_uid,
-                                "gid": st.st_gid
+                                "gid": st.st_gid,
+                                "user": pwd.getpwuid(st.st_uid).pw_name, # NEW
+                                "group": grp.getgrgid(st.st_gid).gr_name # NEW
                             }
                     
                     for file in files:
@@ -274,7 +280,9 @@ def backup(args):
                             permissions[str(dest_file.relative_to(tempdir))] = {
                                 "mode": st.st_mode,
                                 "uid": st.st_uid,
-                                "gid": st.st_gid
+                                "gid": st.st_gid,
+                                "user": pwd.getpwuid(st.st_uid).pw_name, # NEW
+                                "group": grp.getgrgid(st.st_gid).gr_name # NEW
                             }
                             if verbose:
                                 cprint(f"Added file: {src_file} -> {dest_file} (empty: {args.dry_run})", Colors.OKCYAN)
@@ -750,10 +758,28 @@ def restore(args):
         cprint("Restoring file permissions and ownership...", Colors.OKBLUE)
         for rel_path, perm in permissions.items():
             dst = Path(affiliation.get(rel_path, rel_path))
+            # NEW: Resolve UID and GID from username and group name
             try:
+                uid = perm["uid"]
+                gid = perm["gid"]
+                
+                if "user" in perm: # NEW
+                    try:
+                        uid = pwd.getpwnam(perm["user"]).pw_uid
+                    except KeyError:
+                        cprint(f"Warning: User '{perm['user']}' not found on this system. Skipping ownership for {dst}", Colors.WARNING)
+                        continue # Skip ownership restoration for this file
+                
+                if "group" in perm: # NEW
+                    try:
+                        gid = grp.getgrnam(perm["group"]).gr_gid
+                    except KeyError:
+                        cprint(f"Warning: Group '{perm['group']}' not found on this system. Skipping ownership for {dst}", Colors.WARNING)
+                        continue # Skip ownership restoration for this file
+
                 if dst.exists():
                     os.chmod(dst, perm["mode"])
-                    os.chown(dst, perm["uid"], perm["gid"])
+                    os.chown(dst, uid, gid) # Use resolved uid, gid
                     if args.verbose:
                         cprint(f"Set permissions for {dst}: mode={oct(perm['mode'])}, uid={perm['uid']}, gid={perm['gid']}", Colors.OKCYAN)
             except Exception as e:
