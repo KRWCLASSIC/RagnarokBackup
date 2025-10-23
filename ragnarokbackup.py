@@ -497,7 +497,7 @@ def handle_package_restore(backup_pkg_file, dry_run=False, verbose=False):
         elif current_ver is None:
             cprint(f"Package {pkg} not installed. Will install version {backup_ver}.", Colors.OKGREEN)
             if not dry_run:
-                subprocess.run(["sudo", "apt-get", "install", f"{pkg}={backup_ver}"], check=False)
+                subprocess.run(["sudo", "apt-get", "install", "-y", f"{pkg}={backup_ver}"], check=False)
         else:
             # Compare versions
             from packaging import version
@@ -509,7 +509,7 @@ def handle_package_restore(backup_pkg_file, dry_run=False, verbose=False):
                 if ans in ("y", "yes"):
                     cprint(f"Updating {pkg} to {backup_ver}.", Colors.OKGREEN)
                     if not dry_run:
-                        subprocess.run(["sudo", "apt-get", "install", f"{pkg}={backup_ver}"], check=False)
+                        subprocess.run(["sudo", "apt-get", "install", "-y", f"{pkg}={backup_ver}"], check=False)
                 else:
                     cprint(f"Skipped updating {pkg}.", Colors.WARNING)
             elif version.parse(current_ver) > version.parse(backup_ver):
