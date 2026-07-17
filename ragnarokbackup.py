@@ -11,6 +11,18 @@ import os
 import pwd
 import grp
 
+def get_username(uid):
+    try:
+        return pwd.getpwuid(uid).pw_name
+    except KeyError:
+        return None
+
+def get_groupname(gid):
+    try:
+        return grp.getgrgid(gid).gr_name
+    except KeyError:
+        return None
+
 # ANSI color codes
 class Colors:
     HEADER = '\033[95m'
@@ -172,8 +184,8 @@ def backup(args):
                     "mode": st.st_mode,
                     "uid": st.st_uid,
                     "gid": st.st_gid,
-                    "user": pwd.getpwuid(st.st_uid).pw_name, # NEW
-                    "group": grp.getgrgid(st.st_gid).gr_name # NEW
+                    "user": get_username(st.st_uid),
+                    "group": get_groupname(st.st_gid)
                 }
                 if verbose:
                     cprint(f"Added file: {src} -> {dest} (empty: {args.dry_run})", Colors.OKCYAN)
@@ -236,8 +248,8 @@ def backup(args):
                                 "mode": st.st_mode,
                                 "uid": st.st_uid,
                                 "gid": st.st_gid,
-                                "user": pwd.getpwuid(st.st_uid).pw_name, # NEW
-                                "group": grp.getgrgid(st.st_gid).gr_name # NEW
+                                "user": get_username(st.st_uid),
+                                "group": get_groupname(st.st_gid)
                             }
                     
                     for file in files:
@@ -281,8 +293,8 @@ def backup(args):
                                 "mode": st.st_mode,
                                 "uid": st.st_uid,
                                 "gid": st.st_gid,
-                                "user": pwd.getpwuid(st.st_uid).pw_name, # NEW
-                                "group": grp.getgrgid(st.st_gid).gr_name # NEW
+                                "user": get_username(st.st_uid),
+                                "group": get_groupname(st.st_gid)
                             }
                             if verbose:
                                 cprint(f"Added file: {src_file} -> {dest_file} (empty: {args.dry_run})", Colors.OKCYAN)
@@ -763,14 +775,14 @@ def restore(args):
                 uid = perm["uid"]
                 gid = perm["gid"]
                 
-                if "user" in perm: # NEW
+                if perm.get("user"):
                     try:
                         uid = pwd.getpwnam(perm["user"]).pw_uid
                     except KeyError:
                         cprint(f"Warning: User '{perm['user']}' not found on this system. Skipping ownership for {dst}", Colors.WARNING)
                         continue # Skip ownership restoration for this file
                 
-                if "group" in perm: # NEW
+                if perm.get("group"):
                     try:
                         gid = grp.getgrnam(perm["group"]).gr_gid
                     except KeyError:
