@@ -8,19 +8,29 @@ import shutil
 import json
 import sys
 import os
-import pwd
-import grp
+try:
+    import pwd
+except ImportError:
+    pwd = None
+try:
+    import grp
+except ImportError:
+    grp = None
 
 def get_username(uid):
+    if pwd is None:
+        return None
     try:
         return pwd.getpwuid(uid).pw_name
-    except KeyError:
+    except (KeyError, AttributeError):
         return None
 
 def get_groupname(gid):
+    if grp is None:
+        return None
     try:
         return grp.getgrgid(gid).gr_name
-    except KeyError:
+    except (KeyError, AttributeError):
         return None
 
 # ANSI color codes
@@ -45,25 +55,56 @@ def check_zstd():
 
 def get_archive_path(src_path, home):
     src = Path(src_path)
+    src_posix = src.as_posix()
+    home_posix = Path(home).as_posix()
     # Handle /root
-    if str(src) == "/root" or str(src).startswith("/root/"):
-        rel = src.relative_to("/root")
+    if src_posix == "/root":
+        return "home_dirs/root", "home_dirs"
+    elif src_posix.startswith("/root/"):
+        rel = src_posix[len("/root/"):]
         return f"home_dirs/root/{rel}", "home_dirs"
     # Handle /home/<username>
-    elif str(src).startswith("/home/"):
-        parts = src.parts
-        if len(parts) >= 3:
-            username = parts[2]
-            rel = Path(*parts[3:]) if len(parts) > 3 else Path()
+    elif src_posix.startswith("/home/"):
+        parts = src_posix.strip("/").split("/")
+        if len(parts) >= 2:
+            username = parts[1]
+            rel = "/".join(parts[2:]) if len(parts) > 2 else ""
+            if not rel:
+                return f"home_dirs/{username}", "home_dirs"
             return f"home_dirs/{username}/{rel}".rstrip("/"), "home_dirs"
     # Handle current user's home (for non-root users)
-    elif str(src).startswith(str(home)):
-        rel = src.relative_to(home)
-        username = home.name
-        return f"home_dirs/{username}/{rel}", "home_dirs"
+    elif src_posix == home_posix:
+        return f"home_dirs/{Path(home).name}", "home_dirs"
+    elif src_posix.startswith(home_posix + "/"):
+        rel = src_posix[len(home_posix) + 1:]
+        return f"home_dirs/{Path(home).name}/{rel}", "home_dirs"
     # Everything else
-    rel = src.relative_to("/")
+    rel = src_posix.lstrip("/")
     return f"files/{rel}", "files"
+
+def resolve_dest_path(rel_path, affiliation):
+    """Resolve an archive relative path back to its destination system path.
+    Uses affiliation map first, then falls back to inverting the standard archive structure.
+    """
+    if rel_path in affiliation:
+        return Path(affiliation[rel_path])
+    
+    rel_posix = Path(rel_path).as_posix()
+    parts = [p for p in rel_posix.split("/") if p not in (".", "")]
+    if not parts:
+        return Path(rel_path)
+    
+    if parts[0] == "files":
+        return Path("/" + "/".join(parts[1:]))
+    elif parts[0] == "home_dirs":
+        if len(parts) >= 2 and parts[1] == "root":
+            if len(parts) == 2:
+                return Path("/root")
+            return Path("/root/" + "/".join(parts[2:]))
+        elif len(parts) >= 2:
+            return Path("/home/" + "/".join(parts[1:]))
+            
+    return Path(rel_path)
 
 def collect_installed_packages(metadata_dir):
     try:
@@ -208,17 +249,38 @@ def backup(args):
                     "target": target,
                     "is_absolute": Path(target).is_absolute()
                 }
+                st = src.lstat()
+                permissions[str(dest.relative_to(tempdir))] = {
+                    "mode": st.st_mode,
+                    "uid": st.st_uid,
+                    "gid": st.st_gid,
+                    "user": get_username(st.st_uid),
+                    "group": get_groupname(st.st_gid)
+                }
                 if verbose:
                     cprint(f"Added symlink: {src} -> {target} (archived as regular file)", Colors.OKCYAN)
             elif src.is_dir():
+                # Record the directory itself
+                dest.mkdir(parents=True, exist_ok=True)
+                affiliation[str(dest.relative_to(tempdir))] = str(src)
+                st = src.stat()
+                permissions[str(dest.relative_to(tempdir))] = {
+                    "mode": st.st_mode,
+                    "uid": st.st_uid,
+                    "gid": st.st_gid,
+                    "user": get_username(st.st_uid),
+                    "group": get_groupname(st.st_gid)
+                }
+                if verbose:
+                    cprint(f"Added directory: {src} -> {dest}", Colors.OKCYAN)
+
                 for root, dirs, files in os.walk(src, followlinks=False):
                     rel_root = Path(root).relative_to(src)
                     for d in dirs:
                         dir_path = Path(root) / d
                         # Check if directory is a symlink before processing it as a directory
                         if dir_path.is_symlink():
-                            symlink_archive_path, _ = get_archive_path(dir_path, home)
-                            symlink_dest = tempdir / symlink_archive_path
+                            symlink_dest = dest / rel_root / d
                             symlink_dest.parent.mkdir(parents=True, exist_ok=True)
                             
                             # Handle directory symlink
@@ -236,12 +298,21 @@ def backup(args):
                                 "is_absolute": Path(target).is_absolute(),
                                 "is_dir": True
                             }
+                            st = dir_path.lstat()
+                            permissions[str(symlink_dest.relative_to(tempdir))] = {
+                                "mode": st.st_mode,
+                                "uid": st.st_uid,
+                                "gid": st.st_gid,
+                                "user": get_username(st.st_uid),
+                                "group": get_groupname(st.st_gid)
+                            }
                             if verbose:
                                 cprint(f"Added directory symlink: {dir_path} -> {target}", Colors.OKCYAN)
                         else:
                             # Regular directory
                             dest_dir = dest / rel_root / d
                             dest_dir.mkdir(parents=True, exist_ok=True)
+                            affiliation[str(dest_dir.relative_to(tempdir))] = str(dir_path)
                             # Record permissions for directories
                             st = dir_path.stat()
                             permissions[str(dest_dir.relative_to(tempdir))] = {
@@ -251,6 +322,8 @@ def backup(args):
                                 "user": get_username(st.st_uid),
                                 "group": get_groupname(st.st_gid)
                             }
+                            if verbose:
+                                cprint(f"Added directory: {dir_path} -> {dest_dir}", Colors.OKCYAN)
                     
                     for file in files:
                         src_file = Path(root) / file
@@ -274,6 +347,14 @@ def backup(args):
                             links[str(dest_file.relative_to(tempdir))] = {
                                 "target": target,
                                 "is_absolute": Path(target).is_absolute()
+                            }
+                            st = src_file.lstat()
+                            permissions[str(dest_file.relative_to(tempdir))] = {
+                                "mode": st.st_mode,
+                                "uid": st.st_uid,
+                                "gid": st.st_gid,
+                                "user": get_username(st.st_uid),
+                                "group": get_groupname(st.st_gid)
                             }
                             if verbose:
                                 cprint(f"Added symlink: {src_file} -> {target} (archived as regular file)", Colors.OKCYAN)
@@ -578,7 +659,7 @@ def restore(args):
 
     cprint(f"Archive extracted to temp dir: {temp_path}", Colors.OKBLUE)
 
-    # 2. Read affiliation.json
+    # 2. Read affiliation.json, links.json, permissions.json
     affil_path = temp_path / "affiliation.json"
     if not affil_path.exists():
         cprint("affiliation.json not found in backup!", Colors.FAIL)
@@ -587,13 +668,27 @@ def restore(args):
     with open(affil_path, "r") as f:
         affiliation = json.load(f)
         
-    # NEW: Read links.json if it exists
+    # Read links.json if it exists
     links = {}
     links_path = temp_path / "links.json"
     if links_path.exists():
         with open(links_path, "r") as f:
             links = json.load(f)
         cprint(f"Found links.json with {len(links)} entries.", Colors.OKBLUE)
+
+    # Read permissions.json if it exists
+    perm_path = temp_path / "permissions.json"
+    permissions = {}
+    if perm_path.exists():
+        with open(perm_path, "r") as f:
+            permissions = json.load(f)
+    else:
+        cprint("permissions.json not found in backup! Permissions will not be restored.", Colors.WARNING)
+
+    # Backward compatibility: populate affiliation with any missing entries from permissions (e.g. directories in older backups)
+    for rel_path in permissions:
+        if rel_path not in affiliation:
+            affiliation[rel_path] = str(resolve_dest_path(rel_path, affiliation))
 
     # 3. Handle metadata
     meta_dir = temp_path / "metadata"
@@ -655,8 +750,8 @@ def restore(args):
         if meta_path.exists():
             handle_package_restore(meta_path, dry_run=dry_run, verbose=verbose)
 
-    # 4. Restore files
-    cprint("Restoring files...", Colors.HEADER)
+    # 4. Restore files and directories
+    cprint("Restoring files and directories...", Colors.HEADER)
     for archive_rel, orig_path in affiliation.items():
         src = temp_path / archive_rel
         dst = Path(orig_path)
@@ -670,6 +765,14 @@ def restore(args):
             if verbose:
                 cprint(f"Skipping direct restoration of {dst} as it will be created as a symlink", Colors.OKCYAN)
             continue
+        elif src.is_dir():
+            # Create directories if they don't exist
+            if not dst.exists() and not dry_run:
+                dst.mkdir(parents=True, exist_ok=True)
+                if verbose:
+                    cprint(f"Created directory: {dst}", Colors.OKGREEN)
+            elif dst.exists() and verbose:
+                cprint(f"Directory already exists: {dst}", Colors.OKCYAN)
         elif src.is_file():
             result = handle_conflict(src, dst, dry_run, conflict, what="file", verbose=verbose)
             if result == "restore" and not dry_run:
@@ -677,14 +780,8 @@ def restore(args):
                 shutil.copy2(src, dst)
             elif result == "overwrite" and not dry_run:
                 shutil.copy2(src, dst)
-        else:
-            # Create directories if they don't exist
-            if not dst.exists() and not dry_run:
-                dst.mkdir(parents=True, exist_ok=True)
-                if verbose:
-                    cprint(f"Created directory: {dst}", Colors.OKGREEN)
 
-    # NEW: Restore symlinks in a separate pass
+    # 5. Restore symlinks in a separate pass
     if links:
         cprint("Restoring symbolic links...", Colors.HEADER)
         for archive_rel, link_info in links.items():
@@ -697,11 +794,6 @@ def restore(args):
             target = link_info["target"]
             is_dir = link_info.get("is_dir", False)
             
-            # If target is not absolute, make it relative to the link's parent directory
-            if not link_info.get("is_absolute", False):
-                # Target remains as stored - it's already relative
-                pass
-                
             # Handle link creation
             if dst.exists():
                 if dst.is_symlink():
@@ -747,7 +839,6 @@ def restore(args):
                 # Make sure parent directory exists
                 dst.parent.mkdir(parents=True, exist_ok=True)
                 
-                # Create the symlink
                 try:
                     os.symlink(target, dst, target_is_directory=is_dir)
                     if verbose:
@@ -757,45 +848,151 @@ def restore(args):
             else:
                 cprint(f"[DRY-RUN] Would create symlink: {dst} -> {target}", Colors.OKGREEN)
 
-    # Restore permissions unless --no-perm
-    perm_path = temp_path / "permissions.json"
-    permissions = {}
-    if perm_path.exists():
-        with open(perm_path, "r") as f:
-            permissions = json.load(f)
-    else:
-        cprint("permissions.json not found in backup! Permissions will not be restored.", Colors.WARNING)
-
+    # 6. Restore permissions unless --no-perm
     if not args.no_perm and permissions:
         cprint("Restoring file permissions and ownership...", Colors.OKBLUE)
-        for rel_path, perm in permissions.items():
-            dst = Path(affiliation.get(rel_path, rel_path))
-            # NEW: Resolve UID and GID from username and group name
-            try:
-                uid = perm["uid"]
-                gid = perm["gid"]
-                
-                if perm.get("user"):
-                    try:
-                        uid = pwd.getpwnam(perm["user"]).pw_uid
-                    except KeyError:
-                        cprint(f"Warning: User '{perm['user']}' not found on this system. Skipping ownership for {dst}", Colors.WARNING)
-                        continue # Skip ownership restoration for this file
-                
-                if perm.get("group"):
-                    try:
-                        gid = grp.getgrnam(perm["group"]).gr_gid
-                    except KeyError:
-                        cprint(f"Warning: Group '{perm['group']}' not found on this system. Skipping ownership for {dst}", Colors.WARNING)
-                        continue # Skip ownership restoration for this file
+        
+        # Check if running as root
+        is_root = False
+        if hasattr(os, "geteuid"):
+            is_root = (os.geteuid() == 0)
+        elif hasattr(os, "getuid"):
+            is_root = (os.getuid() == 0)
 
-                if dst.exists():
-                    os.chmod(dst, perm["mode"])
-                    os.chown(dst, uid, gid) # Use resolved uid, gid
-                    if args.verbose:
-                        cprint(f"Set permissions for {dst}: mode={oct(perm['mode'])}, uid={perm['uid']}, gid={perm['gid']}", Colors.OKCYAN)
+        if not is_root and not dry_run:
+            cprint("Notice: Restoring file ownership requires root privileges (sudo). Running without root will not change file owner/group.", Colors.WARNING)
+
+        # Collect unique users and groups referenced in permissions
+        unique_users = {p["user"] for p in permissions.values() if p.get("user")}
+        unique_groups = {p["group"] for p in permissions.values() if p.get("group")}
+
+        user_uid_map = {}
+        missing_users = set()
+        for u in unique_users:
+            if pwd is not None:
+                try:
+                    user_uid_map[u] = pwd.getpwnam(u).pw_uid
+                except (KeyError, AttributeError):
+                    missing_users.add(u)
+            else:
+                missing_users.add(u)
+
+        group_gid_map = {}
+        missing_groups = set()
+        for g in unique_groups:
+            if grp is not None:
+                try:
+                    group_gid_map[g] = grp.getgrnam(g).gr_gid
+                except (KeyError, AttributeError):
+                    missing_groups.add(g)
+            else:
+                missing_groups.add(g)
+
+        # Offer to create missing groups and users if running as root
+        if is_root and not dry_run:
+            create_users_flag = getattr(args, "create_users", False)
+            for g in sorted(missing_groups):
+                ans = "y" if create_users_flag else None
+                if ans is None:
+                    try:
+                        ans = input(f"Group '{g}' does not exist on this system. Create group '{g}'? (y/n): ").strip().lower()
+                    except (EOFError, OSError):
+                        ans = "n"
+                if ans in ("y", "yes"):
+                    try:
+                        subprocess.run(["groupadd", "-r", g], check=True)
+                        if grp is not None:
+                            group_gid_map[g] = grp.getgrnam(g).gr_gid
+                        cprint(f"Created system group '{g}'.", Colors.OKGREEN)
+                    except Exception as e:
+                        cprint(f"Could not create group '{g}': {e}", Colors.WARNING)
+
+            # Determine appropriate non-login shell
+            nologin_shell = "/usr/sbin/nologin"
+            if not Path(nologin_shell).exists():
+                if Path("/sbin/nologin").exists():
+                    nologin_shell = "/sbin/nologin"
+                elif Path("/bin/false").exists():
+                    nologin_shell = "/bin/false"
+                else:
+                    nologin_shell = "/bin/sh"
+
+            for u in sorted(missing_users):
+                ans = "y" if create_users_flag else None
+                if ans is None:
+                    try:
+                        ans = input(f"User '{u}' does not exist on this system. Create system user '{u}'? (y/n): ").strip().lower()
+                    except (EOFError, OSError):
+                        ans = "n"
+                if ans in ("y", "yes"):
+                    try:
+                        cmd = ["useradd", "-r", "-s", nologin_shell, "-M"]
+                        if u in group_gid_map:
+                            cmd.extend(["-g", u])
+                        cmd.append(u)
+                        subprocess.run(cmd, check=True)
+                        if pwd is not None:
+                            user_uid_map[u] = pwd.getpwnam(u).pw_uid
+                        cprint(f"Created system user '{u}'.", Colors.OKGREEN)
+                    except Exception as e:
+                        cprint(f"Could not create user '{u}': {e}", Colors.WARNING)
+
+        # Warn once for remaining missing users and groups
+        still_missing_users = {u for u in missing_users if u not in user_uid_map}
+        if still_missing_users:
+            cprint(f"Notice: User(s) not found on system: {', '.join(sorted(still_missing_users))}. Using numeric UID from backup.", Colors.WARNING)
+
+        still_missing_groups = {g for g in missing_groups if g not in group_gid_map}
+        if still_missing_groups:
+            cprint(f"Notice: Group(s) not found on system: {', '.join(sorted(still_missing_groups))}. Using numeric GID from backup.", Colors.WARNING)
+
+        for rel_path, perm in permissions.items():
+            dst = resolve_dest_path(rel_path, affiliation)
+
+            # Resolve UID: use matched system user if available, fallback to numeric UID from backup
+            uid = perm.get("uid")
+            if perm.get("user") and perm["user"] in user_uid_map:
+                uid = user_uid_map[perm["user"]]
+
+            # Resolve GID: use matched system group if available, fallback to numeric GID from backup
+            gid = perm.get("gid")
+            if perm.get("group") and perm["group"] in group_gid_map:
+                gid = group_gid_map[perm["group"]]
+
+            if dry_run:
+                if verbose:
+                    cprint(f"[DRY-RUN] Would set permissions for {dst}: mode={oct(perm.get('mode', 0))}, uid={uid}, gid={gid}", Colors.OKCYAN)
+                continue
+
+            try:
+                if dst.is_symlink():
+                    if uid is not None and gid is not None and hasattr(os, "lchown"):
+                        try:
+                            os.lchown(dst, uid, gid)
+                        except (PermissionError, OSError) as e:
+                            if verbose:
+                                cprint(f"Failed to set symlink ownership for {dst}: {e}", Colors.WARNING)
+                elif dst.exists():
+                    # 1. Chown first (so chown doesn't clear SUID/SGID bits set by chmod)
+                    if uid is not None and gid is not None and hasattr(os, "chown"):
+                        try:
+                            os.chown(dst, uid, gid)
+                        except (PermissionError, OSError) as e:
+                            if verbose:
+                                cprint(f"Failed to set owner for {dst}: {e}", Colors.WARNING)
+                    # 2. Chmod second
+                    if "mode" in perm and hasattr(os, "chmod"):
+                        try:
+                            os.chmod(dst, perm["mode"])
+                        except (PermissionError, OSError) as e:
+                            if verbose:
+                                cprint(f"Failed to set permissions for {dst}: {e}", Colors.WARNING)
+
+                    if verbose:
+                        cprint(f"Set permissions for {dst}: mode={oct(perm.get('mode', 0))}, uid={uid}, gid={gid}", Colors.OKCYAN)
             except Exception as e:
-                cprint(f"Failed to set permissions for {dst}: {e}", Colors.WARNING)
+                if verbose:
+                    cprint(f"Failed to set permissions for {dst}: {e}", Colors.WARNING)
     elif args.no_perm:
         cprint("Skipping permission and ownership restoration (--no-perm set).", Colors.WARNING)
 
@@ -852,6 +1049,11 @@ def main():
         "--no-perm",
         action="store_true",
         help="Do not restore file permissions and ownership."
+    )
+    parser.add_argument(
+        "--create-users",
+        action="store_true",
+        help="Automatically create missing system users and groups during restore."
     )
 
     group = parser.add_mutually_exclusive_group(required=True)
